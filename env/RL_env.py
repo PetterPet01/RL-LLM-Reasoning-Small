@@ -9,7 +9,30 @@ import json
 import os
 
 class RLEnv():
-    def __init__(self,dataset,is_test,LLM_name,problem_indexs,max_depth,max_width,random_problems,random_seed):
+    def __init__(
+        self,
+        dataset,
+        is_test,
+        LLM_name,
+        problem_indexs,
+        max_depth,
+        max_width,
+        random_problems,
+        random_seed,
+        LLM_api_base_url=None,
+        LLM_api_key=None,
+        LLM_api_timeout=60,
+        LLM_max_tokens=4096,
+        LLM_temperature=1.0,
+        LLM_top_p=0.7,
+        LLM_top_k=1,
+        LLM_send_top_k=True,
+        LLM_max_prompt_tokens=None,
+        LLM_prompt_token_chars_per_token=3.0,
+        LLM_skip_oversize_prompts=False,
+        debug_verbose=False,
+        answer_fallback_policy="strict",
+    ):
         super(RLEnv, self).__init__()
         self.action_space = {0:"R", 1:"D", 2:"Db", 3:"Rf", 4:"Ga"}
         self.observation_space = {0:"A1", 1:"A2", 2:"A3", 3:"B1", 4: "B2", 5: "C1", 6:"C2"}
@@ -17,39 +40,54 @@ class RLEnv():
         self.dataset = dataset
         self.is_test = is_test
         self.LLM_args = {"model":LLM_name}
+        if LLM_api_base_url is not None:
+            self.LLM_args["api_base_url"] = LLM_api_base_url
+        if LLM_api_key is not None:
+            self.LLM_args["api_key"] = LLM_api_key
+        self.LLM_args["timeout"] = LLM_api_timeout
+        self.LLM_args["max_tokens"] = LLM_max_tokens
+        self.LLM_args["temperature"] = LLM_temperature
+        self.LLM_args["top_p"] = LLM_top_p
+        self.LLM_args["top_k"] = LLM_top_k
+        self.LLM_args["send_top_k"] = LLM_send_top_k
+        self.LLM_args["max_prompt_tokens"] = LLM_max_prompt_tokens
+        self.LLM_args["prompt_token_chars_per_token"] = LLM_prompt_token_chars_per_token
+        self.LLM_args["skip_oversize_prompts"] = LLM_skip_oversize_prompts
         self.max_depth = max_depth
         self.max_width = max_width
+        self.debug_verbose = debug_verbose
+        self.answer_fallback_policy = answer_fallback_policy
 
         if self.dataset == 'MATH':
             self.ds =  MsDataset.load('modelscope/competition_math', cache_dir='data', subset_name='default', split=('test' if is_test else 'train'))
             self.answer_type = 'Text'
             self.total_problems = len(self.ds)
-            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, equal = is_equiv, debug_verbose=True)
+            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, equal = is_equiv, debug_verbose=self.debug_verbose, answer_fallback_policy=self.answer_fallback_policy)
         
         elif self.dataset == 'GSM8K':
             self.ds =  MsDataset.load('modelscope/gsm8k', cache_dir='data', subset_name='main', split=('test' if is_test else 'train'))
             self.answer_type = 'Numerical'
             self.total_problems = len(self.ds)
-            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=True)
+            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=self.debug_verbose, answer_fallback_policy=self.answer_fallback_policy)
         
         elif self.dataset == 'GPQA':
             self.ds =  pd.read_csv(os.path.join('data', 'gpqa_main.csv'))
             self.answer_type = 'Choice'
             self.total_problems = len(self.ds)
-            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=True)
+            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=self.debug_verbose, answer_fallback_policy=self.answer_fallback_policy)
             
         elif self.dataset == 'MMLU-STEM':
             self.ds =  MsDataset.load('TIGER-Lab/MMLU-STEM', cache_dir='data', split=('test' if is_test else 'train'))
             self.answer_type = 'Choice'
             self.total_problems = len(self.ds)
-            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=True)
+            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=self.debug_verbose, answer_fallback_policy=self.answer_fallback_policy)
 
         elif self.dataset == 'StrategyQA':
             split=('test' if is_test else 'train')
             self.ds =  json.load(open(os.path.join('data', f'strategyQA_{split}.json'), "r"))
             self.answer_type = 'Boolean'
             self.total_problems = len(self.ds)
-            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=True)
+            self.core = ENV(answer_type=self.answer_type, LLM_args=self.LLM_args, max_depth=self.max_depth, max_width=self.max_width, debug_verbose=self.debug_verbose, answer_fallback_policy=self.answer_fallback_policy)
 
         else:
             raise ValueError("Dataset not supported")
@@ -60,7 +98,7 @@ class RLEnv():
             self.problem_indexs = problem_indexs
         self.num_problems = len(self.problem_indexs)
 
-        assert np.max(self.problem_indexs) <= self.total_problems, "num_problems should be less than total_problems"
+        assert np.max(self.problem_indexs) < self.total_problems, "problem index should be less than total_problems"
         self.current_problem = 0
 
         self.random_problems = random_problems

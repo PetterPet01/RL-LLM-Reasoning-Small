@@ -1,128 +1,199 @@
+from __future__ import annotations
+
 import os
-os.chdir(os.path.split(os.path.realpath(__file__))[0])
+import time
+from dataclasses import dataclass
+from typing import Any
 
-from transformers import AutoTokenizer,AutoModelForCausalLM
-import torch
-from tqdm import tqdm
+import httpx
 
-class PRM():
-    def __init__(self, PRM_name, device, max_length=4096):
-        self.model_dir = os.path.join('PRM',PRM_name)
-        self.max_length = max_length
+
+DEFAULT_PRM_API_URL = os.environ.get(
+    "PRM_API_URL",
+    os.environ.get("PRM_BASE_URL", "https://prm.24102006.xyz"),
+)
+
+STEP_TAG = "ки"
+
+
+@dataclass
+class PRMInput:
+    question: str
+    output: str
+    estimated_tokens: int
+    num_steps: int
+
+
+class PRM:
+    """
+    Thin compatibility wrapper around the PRM HTTP API.
+
+    The old training loop expects two methods:
+    - covert_to_input(problem, thoughts)
+    - get_step_scores(input_for_prm) -> (step_scores, n_tokens)
+
+    This class preserves that surface while moving scoring out of the training
+    process and into the FastAPI service in prm_gguf/prm_api.py.
+    """
+
+    def __init__(
+        self,
+        PRM_name: str | None = None,
+        device: str | None = None,
+        max_length: int = 4096,
+        api_base_url: str | None = None,
+        timeout: float = 300.0,
+        max_retries: int = 3,
+        retry_backoff: float = 1.0,
+        healthcheck: bool = True,
+    ) -> None:
+        if api_base_url is None and PRM_name and PRM_name.startswith(("http://", "https://")):
+            api_base_url = PRM_name
+
+        self.PRM_name = PRM_name
         self.device = device
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_dir).to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+        self.max_length = max_length
+        self.max_chars = max_length * 4
+        self.api_base_url = (api_base_url or DEFAULT_PRM_API_URL).rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.client = httpx.Client(
+            base_url=self.api_base_url,
+            timeout=httpx.Timeout(timeout),
+            limits=httpx.Limits(max_connections=16),
+        )
 
-        self.good_token = '+'
-        self.bad_token = '-'
-        self.step_tag = 'ки'
+        if healthcheck:
+            self.health()
 
-        self.candidate_tokens = self.tokenizer.encode(f"{self.good_token} {self.bad_token}")[1:] # [648, 387]
-        self.step_tag_id = self.tokenizer.encode(f"{self.step_tag}")[-1] # 12902
+    def close(self) -> None:
+        self.client.close()
 
-    def covert_to_input(self, problem, thoughts):
+    def __enter__(self) -> "PRM":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def health(self) -> dict[str, Any]:
+        response = self.client.get("/health")
+        response.raise_for_status()
+        return response.json()
+
+    def covert_to_input(self, problem: str, thoughts: list[str]) -> PRMInput:
+        return self.convert_to_input(problem, thoughts)
+
+    def convert_to_input(self, problem: str, thoughts: list[str]) -> PRMInput:
+        if not thoughts:
+            return PRMInput(
+                question=problem,
+                output="",
+                estimated_tokens=self._estimate_tokens(problem),
+                num_steps=0,
+            )
+
         discard = 0
         while True:
-            prm_thoughts = '\n'.join([f"Step {i+1+discard}: {thought} ки" for i, thought in enumerate(thoughts[discard:])])
-            input_text = problem + ' ' + prm_thoughts
-            input_for_prm = torch.tensor([self.tokenizer.encode(input_text)]).to(self.device)
-
-            if input_for_prm.size(1) <= self.max_length or discard == len(thoughts)-1:
+            output = self._format_steps(thoughts[discard:], step_offset=discard)
+            estimated_tokens = self._estimate_tokens(f"{problem} {output}")
+            if estimated_tokens <= self.max_length or discard >= len(thoughts) - 1:
                 break
-            else:
-                discard += 1
+            discard += 1
 
-        return input_for_prm
+        return PRMInput(
+            question=problem,
+            output=output,
+            estimated_tokens=estimated_tokens,
+            num_steps=len(thoughts) - discard,
+        )
 
-    def get_step_scores(self, input_for_prm):
-        n_tokens = input_for_prm.size(1)
+    def get_step_scores(self, input_for_prm: PRMInput | dict[str, Any] | tuple[str, str]):
+        prm_input = self._normalise_input(input_for_prm)
+        if prm_input.num_steps == 0:
+            return [], prm_input.estimated_tokens
 
-        with torch.no_grad():
-            logits = self.model(input_for_prm).logits[:,:,self.candidate_tokens]
-            scores = logits.softmax(dim=-1)[:,:,0] 
-            step_scores = scores[input_for_prm == self.step_tag_id].cpu().tolist()
+        data = self._request_score(
+            {
+                "question": prm_input.question,
+                "output": prm_input.output,
+            }
+        )
+        return [float(score) for score in data["step_scores"]], prm_input.estimated_tokens
 
-        return step_scores,n_tokens
+    def score_steps(self, problem: str, thoughts: list[str]) -> tuple[list[float], int]:
+        return self.get_step_scores(self.convert_to_input(problem, thoughts))
 
-# Test
-if __name__ == '__main__':
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # device = 'cpu'
-    PRM_name = 'MATH-Shepherd-Mistral-7B-PRM'
-    reward_model = PRM(PRM_name, device)
+    def _request_score(self, payload: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.client.post("/score", json=payload)
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt == self.max_retries:
+                    break
+                time.sleep(self.retry_backoff * attempt)
 
-    # question = """Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?"""
-    # output1 = """Step 1: Janet's ducks lay 16 eggs per day. ки""" # 18 is right
-    # output2 = """Step 2: She eats three for breakfast every morning, so she has 16 - 3 = 13 eggs left. ки"""
-    # output3 = """Step 3: She bakes muffins for her friends every day with four eggs, so she has 13 - 4 = 9 eggs left. ки"""
-    # output4 = """Step 4: She sells the remainder at the farmers' market daily for $2 per fresh duck egg, so she makes 9 * 2 = $18 every day at the farmers' market. ки""" # 18 is right
-    # output4w = """Step 4: She sells the remainder at the farmers' market daily for $2 per fresh duck egg, so she makes 9 * 2 = $17 every day at the farmers' market. ки"""
-    # output0 = """Step 0: This is a difficult problem. ки"""
-    # outputs = '\n'.join([output1, output2, output3, output4, output4w, output0])
+        raise RuntimeError(
+            f"PRM API request failed after {self.max_retries} attempts at "
+            f"{self.api_base_url}"
+        ) from last_error
 
-    # for output in [output1, output2, output3, output4, output4w, output0, outputs]:
-    #     step_scores = reward_model.get_step_scores(question, output)
-    #     print(step_scores)
+    @staticmethod
+    def _format_steps(thoughts: list[str], step_offset: int = 0) -> str:
+        return "\n".join(
+            f"Step {idx + 1 + step_offset}: {thought} {STEP_TAG}"
+            for idx, thought in enumerate(thoughts)
+        )
 
-    # question = """Tim wants to invest some money in a bank which compounds quarterly with an annual interest rate of $7\%$. To the nearest dollar, how much money should he invest if he wants a total of $\$60,\!000$ at the end of $5$ years?"""
-    question = """What are all values of $p$ such that for every $q>0$, we have   $$\\frac{3(pq^2+p^2q+3q^2+3pq)}{p+q}>2p^2q?$$ Express your answer in interval notation in decimal form."""
-    output1 = """
-    In this step, we plan for the task and conduct reasoning as follows.
-    To follow the reverse calculation plan, we need to use the compound interest formula to find the present value (the amount Tim should invest now). The formula for the future value \( A \) of an investment compounded \( n \) times per year at an annual interest rate \( r \) over \( t \) years is:
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text.encode("utf-8")) // 4)
 
-    \[ A = P \left(1 + \frac{r}{n}\right)^{nt} \]
+    def _normalise_input(self, input_for_prm: PRMInput | dict[str, Any] | tuple[str, str]) -> PRMInput:
+        if isinstance(input_for_prm, PRMInput):
+            return input_for_prm
 
-    Where:
-    - \( A \) is the future value (\$60,000),
-    - \( P \) is the present value (the amount to be found),
-    - \( r \) is the annual interest rate (7% or 0.07),
-    - \( n \) is the number of times interest is compounded per year (quarterly, so \( n = 4 \)),
-    - \( t \) is the time the money is invested for (5 years).
+        if isinstance(input_for_prm, dict):
+            question = input_for_prm["question"]
+            output = input_for_prm["output"]
+            return PRMInput(
+                question=question,
+                output=output,
+                estimated_tokens=self._estimate_tokens(f"{question} {output}"),
+                num_steps=output.count(STEP_TAG),
+            )
 
-    We need to solve for \( P \). Rearranging the formula to solve for \( P \):
+        if isinstance(input_for_prm, tuple) and len(input_for_prm) == 2:
+            question, output = input_for_prm
+            return PRMInput(
+                question=question,
+                output=output,
+                estimated_tokens=self._estimate_tokens(f"{question} {output}"),
+                num_steps=output.count(STEP_TAG),
+            )
 
-    \[ P = \frac{A}{\left(1 + \frac{r}{n}\right)^{nt}} \]
+        raise TypeError(
+            "input_for_prm must be PRMInput, {'question', 'output'}, or "
+            "(question, output)"
+        )
 
-    Substituting the given values:
 
-    \[ P = \frac{60000}{\left(1 + \frac{0.07}{4}\right)^{4 \times 5}} \]
+if __name__ == "__main__":
+    question = (
+        "Janet's ducks lay 16 eggs per day. She eats three for breakfast and "
+        "bakes muffins with four. She sells the rest for $2 each. How much?"
+    )
+    thoughts = [
+        "Janet starts with 16 eggs.",
+        "After eating 3 and baking with 4, she has 16 - 3 - 4 = 9 eggs.",
+        "She sells 9 eggs at $2 each, so she makes 9 * 2 = 18 dollars.",
+    ]
 
-    This is the next step in the reverse calculation process.
-    """
-
-    output2 = """
-    In this step, we refine the previous step to enhance clarity and correctness.
-    The reasoning provided is correct up to the point of setting up the formula and substituting the values. The next step is to correctly apply the formula and perform the calculation. Here is the refined and correct next step:
-
-    \[ P = \frac{60000}{\left(1 + \frac{0.07}{4}\right)^{4 \times 5}} \]
-
-    This simplifies to:
-
-    \[ P = \frac{60000}{\left(1 + 0.0175\right)^{20}} \]
-
-    \[ P = \frac{60000}{(1.0175)^{20}} \]
-
-    This is the correct expression to find the present value \( P \). The next step would be to calculate the value of \( (1.0175)^{20} \) and then divide 60000 by that value to find \( P \).
-    To find the value of \( P \), we need to calculate \( (1.0175)^{20} \) and then divide 60000 by that value.
-
-    First, calculate \( (1.0175)^{20} \):
-
-    \[ (1.0175)^{20} \approx 1.414778 \]
-
-    Now, divide 60000 by this value:
-
-    \[ P = \frac{60000}{1.414778} \approx 42407.41 \]
-
-    Rounding to the nearest dollar, we get:
-
-    \[ P \approx 42407 \]
-
-    So, the amount Tim should invest is \(\boxed{42407}\).
-    """
-
-    input_for_prm = reward_model.covert_to_input(question, [output1, output2, output1, output2, output1, output2, output1, output2, output1, output2, output1, output2])
-
-    for i in tqdm(range(100)):
-        step_scores,n_tokens = reward_model.get_step_scores(input_for_prm)
-        print(step_scores)
-        print(n_tokens)
+    reward_model = PRM()
+    scores, n_tokens = reward_model.score_steps(question, thoughts)
+    print("estimated_tokens:", n_tokens)
+    print("step_scores:", scores)

@@ -47,9 +47,9 @@ MODEL_PATH: str = os.environ.get(
     "/AIClub_NAS/core_baotg/quanhm/models/math-shepherd-mistral-7b-prm.Q4_K_M.gguf",
 )
 N_GPU_LAYERS: int = int(os.environ.get("PRM_N_GPU_LAYERS", "32"))
-N_CTX: int = int(os.environ.get("PRM_N_CTX", "4096"))
+N_CTX: int = int(os.environ.get("PRM_N_CTX", "8192"))
 NUM_WORKERS: int = int(os.environ.get("PRM_NUM_WORKERS", "1"))
-MAX_BATCH_SIZE: int = int(os.environ.get("PRM_MAX_BATCH_SIZE", "16"))
+MAX_BATCH_SIZE: int = int(os.environ.get("PRM_MAX_BATCH_SIZE", "4"))
 BATCH_TIMEOUT: float = float(os.environ.get("PRM_BATCH_TIMEOUT", "0.05"))  # seconds
 HOST: str = os.environ.get("PRM_HOST", "0.0.0.0")
 PORT: int = int(os.environ.get("PRM_PORT", "8787"))
@@ -86,7 +86,7 @@ def _softmax2(x: np.ndarray) -> np.ndarray:
 
 def _worker_init(model_path: str, n_gpu_layers: int, n_ctx: int) -> None:
     """Called once in each worker process to load the model into a global."""
-    global _LLM, _CANDIDATE_TOKENS, _STEP_TAG_ID  # noqa: PLW0603
+    global _LLM, _CANDIDATE_TOKENS, _STEP_TAG_ID, _WORKER_N_CTX  # noqa: PLW0603
 
     from llama_cpp import Llama  # imported inside worker so parent process stays light
 
@@ -106,6 +106,7 @@ def _worker_init(model_path: str, n_gpu_layers: int, n_ctx: int) -> None:
 
     _CANDIDATE_TOKENS = candidate_tokens
     _STEP_TAG_ID = step_tag_id
+    _WORKER_N_CTX = n_ctx
     log.info(
         "Worker PID %d ready. candidate_tokens=%s step_tag_id=%d",
         os.getpid(),
@@ -119,9 +120,16 @@ def _score_one(question: str, output: str) -> List[float]:
     llm = _LLM  # noqa: F821  (set by _worker_init)
     candidate_tokens = _CANDIDATE_TOKENS  # noqa: F821
     step_tag_id = _STEP_TAG_ID  # noqa: F821
+    worker_n_ctx = _WORKER_N_CTX  # noqa: F821
 
     text = f"{question} {output}"
     tokens = llm.tokenize(text.encode("utf-8"), add_bos=True)
+
+    # Truncate tokens to fit inside the KV cache context window.
+    # Exceeding n_ctx causes `llama_decode returned 1` (failed to find a memory slot).
+    if len(tokens) > worker_n_ctx:
+        log.warning("Truncating sequence of length %d to N_CTX=%d", len(tokens), worker_n_ctx)
+        tokens = tokens[:worker_n_ctx]
 
     llm.reset()
     llm.eval(tokens)

@@ -1,0 +1,33 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environment files
+.env
+.env.*
+
+# Large local model artifacts
+*.gguf
+*.gguf/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+/model/*
+!/model/
+!/model/note.txt
+
+# Generated indexes and local datasets
+/data/problem_indexs/*
+!/data/problem_indexs/
+!/data/problem_indexs/note.txt
+/data/*.csv
+
+# Local reference/download artifacts
+/2505.14140v3.pdf

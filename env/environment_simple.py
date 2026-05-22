@@ -10,7 +10,9 @@ def default_equal(a, b):
     return float(a == b)
 class ENV():
     def __init__(self, max_width=10, max_depth=10, answer_type="Numerical", LLM_args = {}, equal = default_equal,
-                 zero_shot_mode="IO", debug_verbose=False) -> None:
+                 zero_shot_mode="IO", debug_verbose=False, answer_fallback_policy="strict") -> None:
+        if answer_fallback_policy not in {"strict", "random"}:
+            raise ValueError("answer_fallback_policy must be 'strict' or 'random'")
         self.thoughts = {}
         self.current_tid = 0
         self.max_width = max_width
@@ -26,9 +28,23 @@ class ENV():
         self.equal = equal
         assert self.answer_type in ["Numerical", "Choice", "Text", "Boolean"]
         self.zero_shot_mode = zero_shot_mode
+        self.answer_fallback_policy = answer_fallback_policy
         self.n_step = 0
         self.debug = debug_verbose
         self.thought_each_step = []
+        self.last_answer = None
+        self.last_answer_raw = ""
+        self.last_requested_action = None
+        self.last_executed_action = None
+        self.last_done_reason = None
+
+    def _llm_get_text(self, prompt, purpose, **metadata):
+        metadata = dict(metadata)
+        metadata.setdefault("env_step", self.n_step)
+        metadata.setdefault("current_tid", self.current_tid)
+        metadata.setdefault("leaf_nodes", sorted(self.leaf_nodes))
+        metadata.setdefault("node_unexplored", list(self.node_unexplored))
+        return self.LLM.get_text(prompt, purpose=purpose, metadata=metadata)
 
     def reason_1_step(self):
         # reason 1 step
@@ -45,7 +61,13 @@ class ENV():
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[reason_1_step]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "reason_1_step",
+            source_tid=self.current_tid,
+            new_tid=n_thought + 1,
+            source_depth=current_thought.get_depth(),
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
 
@@ -93,7 +115,14 @@ class ENV():
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[reason_1_step]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "reason_1_step_decompose",
+            source_tid=self.current_tid,
+            new_tid=n_thought + 1,
+            subtask_id=subtask_id,
+            source_depth=current_thought.get_depth(),
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
 
@@ -131,7 +160,13 @@ class ENV():
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[reason_1_step]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "reason_1_step_debate",
+            source_tid=self.current_tid,
+            new_tid=n_thought + 1,
+            source_depth=current_thought.get_depth(),
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
 
@@ -165,7 +200,12 @@ class ENV():
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[refine_thought]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "refine_thought",
+            thought_id=self.current_tid,
+            depth=thought.get_depth(),
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
 
@@ -222,7 +262,12 @@ class ENV():
         ## Call LLM and get a few new thought
         if self.debug:
             print('\n\n\n\n\n[decompose]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "decompose",
+            source_tid=self.current_tid,
+            source_depth=current_thought.get_depth(),
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
         if "###" not in LLM_response:
@@ -239,6 +284,21 @@ class ENV():
         if len(LLM_response) == 0:
             LLM_response = ["There problem cannot be divided into subtask, please refer to the original problem."]
             print("Warning: no subtask proposed")
+
+        current_depth = current_thought.get_depth()
+        max_subtasks = min(
+            self._depth_width_available(current_depth + 1),
+            self._depth_width_available(current_depth + 2),
+        )
+        if max_subtasks <= 0:
+            print("Warning: decompose blocked by max_width/max_depth; using one-step reasoning instead")
+            self.leaf_nodes.add(self.current_tid)
+            self.node_unexplored.append(self.current_tid)
+            self.reason_1_step()
+            return
+        if len(LLM_response) > max_subtasks:
+            print(f"Warning: truncating subtasks from {len(LLM_response)} to {max_subtasks} to respect max_width")
+            LLM_response = LLM_response[:max_subtasks]
 
         new_thought_id = []
         for i, text in enumerate(LLM_response[::-1]):
@@ -280,7 +340,11 @@ class ENV():
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[simplify_decompose]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "simplify_decompose",
+            thought_id=self.current_tid,
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
         simplified_text = text_before_decompose + f"\nSTEP{self.n_step}: \nIn this step, the task is decomposed into a few subtasks, and the following is a summary of the reasonings in these subtasks:\n" + LLM_response
@@ -301,7 +365,12 @@ class ENV():
         ## Call LLM and get a few new thought
         if self.debug:
             print('\n\n\n\n\n[debate]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "debate_generate_plans",
+            source_tid=self.current_tid,
+            source_depth=current_thought.get_depth(),
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
         if "###" not in LLM_response:
@@ -320,6 +389,19 @@ class ENV():
         if len(LLM_response) == 0:
             LLM_response = ["There is no plan proposed, please refer to the original problem."]
             print("Warning: no plan proposed")
+
+        current_depth = current_thought.get_depth()
+        max_plans = self._depth_width_available(current_depth + 1)
+        if max_plans <= 0 or not self._can_add_nodes(current_depth + 2, 1) or not self._can_add_nodes(current_depth + 3, 1):
+            print("Warning: debate blocked by max_width/max_depth; using one-step reasoning instead")
+            self.leaf_nodes.add(self.current_tid)
+            self.node_unexplored.append(self.current_tid)
+            self.reason_1_step()
+            return
+        if len(LLM_response) > max_plans:
+            print(f"Warning: truncating debate plans from {len(LLM_response)} to {max_plans} to respect max_width")
+            LLM_response = LLM_response[:max_plans]
+
         new_thought_id = []
         for i, text in enumerate(LLM_response[::-1]):
             new_thought = LLM_thought(
@@ -353,7 +435,12 @@ Use the format \'The most promising plan is Plan[INDEX]: [REASON]\', where [INDE
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[aggregate_1]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "debate_select_plan",
+            plan_count=len(plans),
+            aggregation_nodes=list(agg_nodes),
+        )
         ## find the most promising plan
         #format:  The most promising plan is Plan1: 
         try:
@@ -440,9 +527,15 @@ Use the format \'The most promising plan is Plan[INDEX]: [REASON]\', where [INDE
 
         if self.debug:
             print('\n\n\n\n\n[get_answer]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "get_answer",
+            leaf_nodes=sorted(self.leaf_nodes),
+            answer_type=self.answer_type,
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
+        self.last_answer_raw = LLM_response
 
         new_thought = LLM_thought(
             tid = len(self.thoughts) + 1,
@@ -478,23 +571,20 @@ Use the format \'The most promising plan is Plan[INDEX]: [REASON]\', where [INDE
             except:
                 print(ori_response)
                 LLM_response = float(-998244353)
+            self.last_answer = LLM_response
             return LLM_response
         
         elif self.answer_type == "Choice":
-            # template = "The correct answer is (C)"
-            match_result = re.search("the answer is \([a-d]\)", LLM_response.lower())
-            if match_result is None:
-                match_result = re.search("the answer is [a-d]", LLM_response.lower())
-            if match_result is None:
+            choice = self.extract_choice_answer(LLM_response)
+            if choice is None:
                 print("Warning: answer is not a choice")
                 print(LLM_response)
-                choice = random.choice(["A", "B", "C", "D"])
-                return choice
-            else:
-                choice = match_result.group(0)[-2].upper()
-
+                if self.answer_fallback_policy == "random":
+                    choice = random.choice(["A", "B", "C", "D"])
+            self.last_answer = choice
             return choice
         elif self.answer_type == "Text":
+            self.last_answer = LLM_response
             return LLM_response
         elif self.answer_type == "Boolean":
             template = "the answer is yes"
@@ -506,8 +596,30 @@ Use the format \'The most promising plan is Plan[INDEX]: [REASON]\', where [INDE
             else:
                 print("Warning: answer is not a boolean")
                 print(LLM_response)
-                flg = random.choice(["yes", "no"])
+                flg = None
+                if self.answer_fallback_policy == "random":
+                    flg = random.choice(["yes", "no"])
+            self.last_answer = flg
             return flg
+
+    @staticmethod
+    def extract_choice_answer(response):
+        patterns = [
+            r"(?:the\s+)?(?:final\s+|correct\s+)?answer\s+is\s*[:\-]?\s*(?:choice|option)\s*\(?\s*([A-D])\s*\)?",
+            r"the\s+answer\s+is\s*[:\-]?\s*(?:\*\*)?\s*\$?\s*(?:\\boxed\{\s*)?(?:\\text\{\s*)?\(?\s*([A-D])\s*\)?",
+            r"final\s+answer\s*[:\-]?\s*(?:\*\*)?\s*\$?\s*(?:\\boxed\{\s*)?(?:\\text\{\s*)?\(?\s*([A-D])\s*\)?",
+            r"correct\s+answer\s+is\s*[:\-]?\s*(?:\*\*)?\s*\$?\s*(?:\\boxed\{\s*)?(?:\\text\{\s*)?\(?\s*([A-D])\s*\)?",
+            r"\\boxed\{\s*(?:\\text\{\s*)?\(?\s*([A-D])\s*\)?",
+            r"(?:choice|option)\s*\(?\s*([A-D])\s*\)?\s+(?:is|matches|corresponds|provides|gives)\b",
+        ]
+        matches = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, response or "", flags=re.IGNORECASE):
+                matches.append((match.start(), match.group(1).upper()))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item[0])
+        return matches[-1][1]
         
     def reset(self):
         # reset
@@ -520,6 +632,11 @@ Use the format \'The most promising plan is Plan[INDEX]: [REASON]\', where [INDE
         self.node_unexplored = []
         self.vis_graph = nx.DiGraph()
         self.score = {}
+        self.last_answer = None
+        self.last_answer_raw = ""
+        self.last_requested_action = None
+        self.last_executed_action = None
+        self.last_done_reason = None
 
         self.LLM.reset_token()
 
@@ -592,12 +709,52 @@ Use the format \'The most promising plan is Plan[INDEX]: [REASON]\', where [INDE
         self.score[0] = self.thought_2_state(0)
         self.n_step = 0
 
+    def _depth_width_available(self, depth):
+        return self.max_width - len(self.depth_2_id.get(depth, []))
+
+    def _can_add_nodes(self, depth, count=1):
+        return depth <= self.max_depth and self._depth_width_available(depth) >= count
+
+    def _can_reason_one_step(self):
+        current_depth = self.thoughts[self.current_tid].get_depth()
+        return self._can_add_nodes(current_depth + 1, 1)
+
+    def _can_decompose(self):
+        current_depth = self.thoughts[self.current_tid].get_depth()
+        return (
+            current_depth + 2 <= self.max_depth
+            and self._depth_width_available(current_depth + 1) >= 1
+            and self._depth_width_available(current_depth + 2) >= 1
+        )
+
+    def _can_debate(self):
+        current_depth = self.thoughts[self.current_tid].get_depth()
+        return (
+            current_depth + 3 <= self.max_depth
+            and self._depth_width_available(current_depth + 1) >= 1
+            and self._depth_width_available(current_depth + 2) >= 1
+            and self._depth_width_available(current_depth + 3) >= 1
+        )
+
+    def _guard_action(self, action):
+        if self.n_step == 0 and action == "Rf":
+            action = "R"
+        if self.n_step >= self.max_depth and action != "Ga":
+            return "Ga"
+        if action in {"R", "Rf"} and not self._can_reason_one_step():
+            return "Ga"
+        if action == "D" and not self._can_decompose():
+            return "R" if self._can_reason_one_step() else "Ga"
+        if action == "Db" and not self._can_debate():
+            return "R" if self._can_reason_one_step() else "Ga"
+        return action
+
     def check_width_depth(self):
         # check width and depth
         for k, v in self.depth_2_id.items():
             if len(v) > self.max_width:
                 return False
-        if len(self.depth_2_id) > self.max_depth:
+        if self.depth_2_id and max(self.depth_2_id) > self.max_depth:
             return False
         return True
 
@@ -646,7 +803,11 @@ Only score the current reasoning step here, and DONOT conduct further reasonings
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[thought_2_state]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "thought_2_state",
+            thought_id=thought_id,
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
         state = extract_state(LLM_response)
@@ -658,7 +819,11 @@ Only score the current reasoning step here, and DONOT conduct further reasonings
         ## Call LLM and get a new thought
         if self.debug:
             print('\n\n\n\n\n[check_finished]\n===========prompt===========', prompt, '==========response=============', sep="\n")
-        LLM_response = self.LLM.get_text(prompt)
+        LLM_response = self._llm_get_text(
+            prompt,
+            "check_finished",
+            thought_id=self.current_tid,
+        )
         if self.debug:
             print(LLM_response, "\n==========================")
         if "yes" in LLM_response.lower():
@@ -678,11 +843,14 @@ Only score the current reasoning step here, and DONOT conduct further reasonings
         self.LLM.print_usage()
 
     def step(self, action):
-        if self.n_step == 0 and action == "Rf":
-            action = "R"
+        self.last_requested_action = action
+        action = self._guard_action(action)
+        self.last_executed_action = action
+        self.last_done_reason = None
         self.n_step += 1
-        if self.n_step > self.max_depth:
+        if action == "Ga":
             ans = self.get_answer()
+            self.last_done_reason = "terminate_action"
             return self.score[self.current_tid], self.equal(ans, self.ans), True
         # api for RL
         if action == "R":
@@ -694,9 +862,6 @@ Only score the current reasoning step here, and DONOT conduct further reasonings
             self.refine_thought()
         elif action == "Db":
             self.debate()
-        elif action == "Ga":
-            ans = self.get_answer()
-            return self.score[self.current_tid], self.equal(ans, self.ans), True
         else:
             print("Invalid action")
             return
@@ -704,6 +869,7 @@ Only score the current reasoning step here, and DONOT conduct further reasonings
         finished = self.check_finished()
         if finished:
             ans = self.get_answer()
+            self.last_done_reason = "answer_detected"
             return self.score[self.current_tid], self.equal(ans, self.ans), True
         
         return self.score[self.current_tid], 0, False
